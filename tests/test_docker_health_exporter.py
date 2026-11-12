@@ -246,11 +246,37 @@ class MetricsEndpointTest(unittest.TestCase):
 
         response = exporter.app.test_client().get('/metrics')
 
-        exporter.client.containers.list.assert_called_once_with(all=True)
+        exporter.client.containers.list.assert_called_once_with(
+            all=True, ignore_removed=True,
+        )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, 'text/plain')
         self.assertEqual(response.get_data(as_text=True),
                          exporter.render_metrics(ALL_CONTAINERS))
+
+
+class HealthzEndpointTest(unittest.TestCase):
+
+    def setUp(self):
+        exporter.client.reset_mock(side_effect=True)
+
+    def tearDown(self):
+        exporter.client.reset_mock(side_effect=True)
+
+    def test_ok_when_docker_answers_without_inspecting_containers(self):
+        response = exporter.app.test_client().get('/healthz')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_data(as_text=True), 'ok\n')
+        exporter.client.ping.assert_called_once_with()
+        exporter.client.containers.list.assert_not_called()
+
+    def test_fails_when_docker_is_unreachable(self):
+        exporter.client.ping.side_effect = ConnectionError('no docker socket')
+
+        response = exporter.app.test_client().get('/healthz')
+
+        self.assertEqual(response.status_code, 500)
 
 
 if __name__ == '__main__':

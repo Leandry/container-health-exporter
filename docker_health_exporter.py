@@ -115,9 +115,18 @@ def render_metrics(containers):
 
 @app.route('/metrics')
 def metrics():
-    # list() inspects every container once; all metrics come from that data
-    containers = client.containers.list(all=True)
+    # list() inspects every container once; all metrics come from that data.
+    # A container removed between the listing and its inspect is left out.
+    containers = client.containers.list(all=True, ignore_removed=True)
     return Response(render_metrics(containers), mimetype='text/plain')
+
+
+@app.route('/healthz')
+def healthz():
+    # For the image's HEALTHCHECK: one Docker ping, no container inspects.
+    # Fails with HTTP 500 when the Docker daemon cannot be reached.
+    client.ping()
+    return Response("ok\n", mimetype='text/plain')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=9066)
