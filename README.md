@@ -125,6 +125,8 @@ curl http://localhost:9066/metrics
 ```
 You should see the same metrics describing Docker container health.
 
+The image has a built-in `HEALTHCHECK` that calls `/healthz` every 30 seconds. That endpoint makes one Docker ping (no container inspects) and fails when the Docker daemon cannot be reached, so `docker ps` shows the exporter itself as `healthy` or `unhealthy`, and the exporter appears in its own `docker_container_health_status`.
+
 3. Configuring Prometheus
 
 Add or update a scrape config in your prometheus.yml:
@@ -187,9 +189,9 @@ python -m unittest
 
 The image `leandry/container-health-exporter` is published to Docker Hub by the GitHub Actions workflow `.github/workflows/publish.yml`.
 
-	1.	Bump the version: `__version__` in `docker_health_exporter.py` and a new entry in `CHANGELOG.md`.
+	1.	Bump the version: `__version__` in `docker_health_exporter.py` and a new entry in `CHANGELOG.md`. Dependencies are pinned in `requirements.txt` and the Python version in the `Dockerfile`; update them as part of a release.
 	2.	Create a GitHub release with the tag `vX.Y.Z`.
-	3.	The workflow builds the image for `linux/amd64` and `linux/arm64`, pushes it with the tags `X.Y.Z`, `X.Y`, `sha-<commit>` and `latest`, and updates the Docker Hub description from this README.
+	3.	The workflow runs the unit tests inside the image, then builds the image for `linux/amd64` and `linux/arm64`, pushes it with the tags `X.Y.Z`, `X.Y`, `sha-<commit>` and `latest`, and updates the Docker Hub description from this README.
 
 To republish an existing tag, run the workflow manually (Actions → Publish image → Run workflow) and enter the tag, for example `v1.1.0`.
 
