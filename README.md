@@ -31,7 +31,17 @@ Where:
 | `docker_container_oom_killed` | 1 if the last exit was an OOM kill, else 0 | `State.OOMKilled` |
 | `docker_container_exit_code` | exit code of the last exit, only exposed when the container is not running | `State.ExitCode` |
 
-All metrics are gauges and come from the single container inspect the exporter performs per container, so a scrape makes no extra Docker API calls.
+All `docker_container_*` metrics are gauges and come from the single container inspect the exporter performs per container, so a scrape makes no extra Docker API calls.
+
+The exporter also reports on itself:
+
+| Metric | Value |
+|---|---|
+| `docker_health_exporter_build_info` | always 1; the label `version` holds the exporter version |
+| `docker_health_exporter_scrape_duration_seconds` | time this scrape spent querying Docker |
+| `docker_health_exporter_scrape_errors_total` | counter of scrapes that failed because Docker could not be queried, since the exporter started |
+
+A scrape that cannot query Docker fails with HTTP 500, so `up` turns 0 in Prometheus. The exporter waits at most 10 seconds for the Docker daemon.
 
 **Labels.** Every metric carries the label `container` (the container name). `docker_container_health_status` additionally carries its `health_status` label. The restart and lifecycle metrics deliberately do not: a series whose labels change with the health status would start over on every health transition, and `increase()` would miss the restarts of exactly the containers that are crashing. To combine metrics, join on the container name:
 
@@ -125,6 +135,21 @@ curl http://localhost:9066/metrics
 ```
 You should see the same metrics describing Docker container health.
 
+2.4 Hardened
+
+The exporter writes nothing to its filesystem and needs no Linux capabilities, so it can run locked down:
+```yaml
+  monitoring_health_check_exporter:
+    image: leandry/container-health-exporter:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: always
+```
+With `docker run`, the same is `--read-only --cap-drop ALL --security-opt no-new-privileges`. The image does not contain `pip`.
+
 The image has a built-in `HEALTHCHECK` that calls `/healthz` every 30 seconds. That endpoint makes one Docker ping (no container inspects) and fails when the Docker daemon cannot be reached, so `docker ps` shows the exporter itself as `healthy` or `unhealthy`, and the exporter appears in its own `docker_container_health_status`.
 
 3. Configuring Prometheus
@@ -185,15 +210,21 @@ pip install -r requirements.txt
 python -m unittest
 ```
 
+Every pull request and every push to `main` runs `.github/workflows/ci.yml`: the unit tests inside the image, a run of the image with a read-only filesystem and no capabilities, a vulnerability scan of the image (Trivy; fails on high or critical vulnerabilities that have a fix), and linters for the Dockerfile (hadolint) and the workflows (actionlint).
+
 7. Releasing
 
 The image `leandry/container-health-exporter` is published to Docker Hub by the GitHub Actions workflow `.github/workflows/publish.yml`.
 
-	1.	Bump the version: `__version__` in `docker_health_exporter.py` and a new entry in `CHANGELOG.md`. Dependencies are pinned in `requirements.txt` and the Python version in the `Dockerfile`; update them as part of a release.
+	1.	Bump the version: `__version__` in `docker_health_exporter.py` and a new entry in `CHANGELOG.md`.
 	2.	Create a GitHub release with the tag `vX.Y.Z`.
-	3.	The workflow runs the unit tests inside the image, then builds the image for `linux/amd64` and `linux/arm64`, pushes it with the tags `X.Y.Z`, `X.Y`, `sha-<commit>` and `latest`, and updates the Docker Hub description from this README.
+	3.	The workflow runs the unit tests inside the image and scans it for vulnerabilities, then builds the image for `linux/amd64` and `linux/arm64`, pushes it with the tags `X.Y.Z`, `X.Y`, `sha-<commit>` and `latest`, and updates the Docker Hub description from this README. A release with high or critical vulnerabilities that have a fix is not published.
 
-To republish an existing tag, run the workflow manually (Actions → Publish image → Run workflow) and enter the tag, for example `v1.1.0`.
+**Weekly rebuild.** Every Monday the workflow rebuilds the newest release from its tag and pushes it under the same tags, so that the published image picks up updates of the base image. This rebuild is published even when the scan finds vulnerabilities, because it is never worse than the image it replaces; the run is then marked as failed. GitHub pauses scheduled workflows after 60 days without activity in the repository.
+
+**Republishing.** To republish an existing tag, run the workflow manually (Actions → Publish image → Run workflow) and enter the tag, for example `v1.1.0`. The tags `latest` and `X.Y` and the Docker Hub description move only when the tag is the newest version, so republishing an older tag does not move them backwards.
+
+**Dependency updates.** Dependencies are pinned in `requirements.txt` and the Python version in the `Dockerfile`. Dependabot (`.github/dependabot.yml`) opens a pull request every week for new versions of the Python dependencies, the base image and the GitHub Actions. An update reaches Docker Hub with the next release.
 
 The workflow needs two repository secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token, not the account password). Give the token the `Read, Write, Delete` scope: `Read & Write` is enough to push the image, but the action that updates the Docker Hub description documents `read/write/delete` as required.
 

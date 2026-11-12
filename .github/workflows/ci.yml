@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: container-health-exporter:ci
+
+jobs:
+  image:
+    name: Tests, hardened run and vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run unit tests in the image
+        run: docker run --rm -v "$PWD/tests:/app/tests:ro" "$IMAGE" python -m unittest
+
+      - name: Run the image with a read-only filesystem and no capabilities
+        run: |
+          docker run -d --name exporter \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            -p 9066:9066 -v /var/run/docker.sock:/var/run/docker.sock "$IMAGE"
+          curl --fail --silent --show-error --retry 15 --retry-delay 1 --retry-all-errors \
+            http://localhost:9066/metrics | tee metrics.txt
+          grep -q '^docker_container_running{container="exporter"} 1$' metrics.txt
+          grep -q '^docker_health_exporter_scrape_errors_total 0$' metrics.txt
+          curl --fail --silent --show-error http://localhost:9066/healthz
+
+      - name: Show exporter logs
+        if: always()
+        run: docker logs exporter || true
+
+      - name: Scan the image for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+  lint:
+    name: Lint Dockerfile and workflows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Lint Dockerfile
+        run: docker run --rm -i hadolint/hadolint:v2.15.1-alpine hadolint - < Dockerfile
+
+      - name: Lint workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color

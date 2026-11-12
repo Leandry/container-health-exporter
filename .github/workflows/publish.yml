@@ -8,6 +8,9 @@ on:
       tag:
         description: Git tag to build and publish (for example v1.2.0)
         required: true
+  schedule:
+    # Every Monday: rebuild the newest release, to pick up base image updates
+    - cron: '17 4 * * 1'
 
 permissions:
   contents: read
@@ -16,13 +19,65 @@ env:
   IMAGE: leandry/container-health-exporter
 
 jobs:
+  resolve:
+    name: Resolve the tag to publish
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      latest: ${{ steps.resolve.outputs.latest }}
+      minor: ${{ steps.resolve.outputs.minor }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Published vX.Y.Z releases, oldest to newest
+          releases=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+            --exclude-drafts --exclude-pre-releases --json tagName --jq '.[].tagName' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V)
+
+          # A release or a manual run names the tag; the schedule takes the newest release
+          tag=${REQUESTED_TAG:-$(printf '%s\n' "$releases" | tail -n 1)}
+          if [ -z "$tag" ]; then
+            echo "::notice::There is no release to rebuild yet"
+            exit 0
+          fi
+
+          # `latest` and `X.Y` move only to the newest version, so that
+          # republishing an older tag does not move them backwards
+          latest=false
+          minor=false
+          if [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            versions=$(printf '%s\n' "$releases" "$tag")
+            newest=$(printf '%s\n' "$versions" | sort -V | tail -n 1)
+            # Same major.minor: the names that start with "vX.Y."
+            newest_in_series=$(printf '%s\n' "$versions" \
+              | awk -v prefix="${tag%.*}." 'index($0, prefix) == 1' | sort -V | tail -n 1)
+            if [ "$newest" = "$tag" ]; then latest=true; fi
+            if [ "$newest_in_series" = "$tag" ]; then minor=true; fi
+          fi
+
+          echo "Publishing $tag (latest: $latest, major.minor: $minor)"
+          {
+            echo "tag=$tag"
+            echo "latest=$latest"
+            echo "minor=$minor"
+          } >> "$GITHUB_OUTPUT"
+
   publish:
+    name: Test, scan and publish
+    needs: resolve
+    if: needs.resolve.outputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - name: Check out
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.tag }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -41,6 +96,20 @@ jobs:
       - name: Run unit tests in the image
         run: docker run --rm -v "$PWD/tests:/app/tests:ro" "$IMAGE:test" python -m unittest
 
+      # A release with fixable high or critical vulnerabilities is not published.
+      # The weekly rebuild is published anyway, because it is never worse than the
+      # image it replaces; the run then fails in the last step to draw attention.
+      - name: Scan the image for vulnerabilities
+        id: scan
+        continue-on-error: ${{ github.event_name == 'schedule' }}
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:test
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
         with:
@@ -51,12 +120,16 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
+          # Take the commit from the checked out tag, not from the workflow run
+          context: git
           images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
           tags: |
-            type=semver,pattern={{version}},value=${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+            type=semver,pattern={{version}},value=${{ needs.resolve.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve.outputs.tag }},enable=${{ needs.resolve.outputs.minor }}
             type=sha,format=short
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.resolve.outputs.latest }}
           labels: |
             org.opencontainers.image.title=container-health-exporter
             org.opencontainers.image.description=Prometheus exporter for Docker container health, restarts and lifecycle
@@ -74,9 +147,16 @@ jobs:
           provenance: false
 
       - name: Update Docker Hub description
+        if: needs.resolve.outputs.latest == 'true'
         uses: peter-evans/dockerhub-description@v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.IMAGE }}
           readme-filepath: ./README.md
+
+      - name: Fail the run when the scan found vulnerabilities
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "::error::The image was published, but the scan found fixable high or critical vulnerabilities"
+          exit 1

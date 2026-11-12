@@ -4,9 +4,12 @@ FROM python:3.15-alpine
 WORKDIR /app
 
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+# pip is needed only to install the dependencies. It is removed afterwards, so
+# that neither pip nor the libraries bundled inside it are in the running image.
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip uninstall -y pip
 
-COPY docker_health_exporter.py /app/
+COPY docker_health_exporter.py gunicorn.conf.py /app/
 
 # Expose port 9066 for Prometheus scraping
 EXPOSE 9066

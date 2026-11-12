@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import re
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import docker
@@ -7,8 +9,17 @@ from flask import Flask, Response
 
 __version__ = '1.1.0'
 
+# Seconds to wait for the Docker daemon before a request to it fails. Kept well
+# below Gunicorn's worker timeout, so that a hung daemon fails the scrape and
+# does not get the worker killed.
+DOCKER_TIMEOUT_SECONDS = 10
+
 app = Flask(__name__)
-client = docker.from_env()
+client = docker.from_env(timeout=DOCKER_TIMEOUT_SECONDS)
+
+# Scrapes that failed because Docker could not be queried, since process start
+scrape_errors = 0
+scrape_errors_lock = threading.Lock()
 
 # Lifecycle gauges, in output order: (metric name, help text)
 LIFECYCLE_METRICS = [
@@ -73,8 +84,8 @@ def format_value(value):
     return str(int(value)) if value == int(value) else repr(value)
 
 
-def render_metrics(containers):
-    """Render the metrics of the given containers in the text exposition format."""
+def container_metric_lines(containers):
+    """Exposition lines of the health and lifecycle metrics of the containers."""
     output = []
     lifecycle = {name: [] for name, _ in LIFECYCLE_METRICS}
 
@@ -109,16 +120,53 @@ def render_metrics(containers):
             output.append(f'# TYPE {name} gauge')
             output.extend(lifecycle[name])
 
+    return output
+
+
+def exporter_metric_lines(scrape_duration):
+    """Exposition lines of the metrics about the exporter itself."""
+    prefix = 'docker_health_exporter'
+    return [
+        f'# HELP {prefix}_build_info Version of the exporter; the value is always 1.',
+        f'# TYPE {prefix}_build_info gauge',
+        f'{prefix}_build_info{{version="{__version__}"}} 1',
+        f'# HELP {prefix}_scrape_duration_seconds Time this scrape spent querying Docker.',
+        f'# TYPE {prefix}_scrape_duration_seconds gauge',
+        f'{prefix}_scrape_duration_seconds {scrape_duration:.6f}',
+        f'# HELP {prefix}_scrape_errors_total Scrapes that failed because Docker'
+        ' could not be queried, since the exporter started.',
+        f'# TYPE {prefix}_scrape_errors_total counter',
+        f'{prefix}_scrape_errors_total {scrape_errors}',
+    ]
+
+
+def render(lines):
     # Join all metrics with newlines; add a final newline
-    return "\n".join(output) + "\n"
+    return "\n".join(lines) + "\n"
+
+
+def render_metrics(containers):
+    """Render the metrics of the given containers in the text exposition format."""
+    return render(container_metric_lines(containers))
 
 
 @app.route('/metrics')
 def metrics():
-    # list() inspects every container once; all metrics come from that data.
-    # A container removed between the listing and its inspect is left out.
-    containers = client.containers.list(all=True, ignore_removed=True)
-    return Response(render_metrics(containers), mimetype='text/plain')
+    global scrape_errors
+    started = time.monotonic()
+    try:
+        # list() inspects every container once; all metrics come from that data.
+        # A container removed between the listing and its inspect is left out.
+        containers = client.containers.list(all=True, ignore_removed=True)
+    except Exception:
+        # The scrape still fails with HTTP 500, so `up` turns 0 in Prometheus
+        with scrape_errors_lock:
+            scrape_errors += 1
+        raise
+    duration = time.monotonic() - started
+
+    lines = container_metric_lines(containers) + exporter_metric_lines(duration)
+    return Response(render(lines), mimetype='text/plain')
 
 
 @app.route('/healthz')
