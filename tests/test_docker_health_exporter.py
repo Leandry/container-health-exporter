@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 # The module creates its Docker client on import; no daemon is needed for tests.
-with mock.patch('docker.from_env'):
+with mock.patch('docker.from_env') as from_env:
     import docker_health_exporter as exporter
 
 HEALTH_METRIC = 'docker_container_health_status'
@@ -240,19 +240,74 @@ class StartedAtSecondsTest(unittest.TestCase):
 
 class MetricsEndpointTest(unittest.TestCase):
 
-    def test_endpoint_lists_all_containers_once(self):
-        exporter.client.containers.list.reset_mock()
+    def setUp(self):
+        exporter.client.reset_mock(side_effect=True)
         exporter.client.containers.list.return_value = ALL_CONTAINERS
 
+    def tearDown(self):
+        exporter.client.reset_mock(side_effect=True)
+
+    def scrape(self):
         response = exporter.app.test_client().get('/metrics')
+        return response, response.get_data(as_text=True)
+
+    def value_of(self, body, metric):
+        match = re.search(rf'^{metric}(?:{{[^}}]*}})? (\S+)$', body, re.MULTILINE)
+        self.assertIsNotNone(match, f'{metric} not found')
+        return float(match.group(1))
+
+    def test_endpoint_lists_all_containers_once(self):
+        response, body = self.scrape()
 
         exporter.client.containers.list.assert_called_once_with(
             all=True, ignore_removed=True,
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, 'text/plain')
-        self.assertEqual(response.get_data(as_text=True),
-                         exporter.render_metrics(ALL_CONTAINERS))
+        self.assertTrue(body.startswith(exporter.render_metrics(ALL_CONTAINERS)))
+
+    def test_exporter_metrics_follow_the_container_metrics(self):
+        _, body = self.scrape()
+        own = body[len(exporter.render_metrics(ALL_CONTAINERS)):]
+
+        self.assertIn(
+            f'docker_health_exporter_build_info{{version="{exporter.__version__}"}} 1\n',
+            own,
+        )
+        self.assertGreaterEqual(
+            self.value_of(own, 'docker_health_exporter_scrape_duration_seconds'), 0,
+        )
+        self.assertIn('# TYPE docker_health_exporter_scrape_errors_total counter\n', own)
+        self.assertNotIn('docker_container_', own)
+
+    def test_exporter_metrics_are_served_without_any_container(self):
+        exporter.client.containers.list.return_value = []
+
+        response, body = self.scrape()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body.startswith('# HELP docker_health_exporter_build_info '))
+
+    def test_failed_scrape_is_an_error_and_is_counted(self):
+        _, body = self.scrape()
+        before = self.value_of(body, 'docker_health_exporter_scrape_errors_total')
+
+        exporter.client.containers.list.side_effect = ConnectionError('docker is down')
+        with self.assertLogs(exporter.app.logger, 'ERROR'):
+            response, _ = self.scrape()
+        self.assertEqual(response.status_code, 500)
+
+        exporter.client.containers.list.side_effect = None
+        _, body = self.scrape()
+        after = self.value_of(body, 'docker_health_exporter_scrape_errors_total')
+        self.assertEqual(after, before + 1)
+
+
+class DockerClientTest(unittest.TestCase):
+
+    def test_client_has_a_timeout_below_the_gunicorn_worker_timeout(self):
+        from_env.assert_called_once_with(timeout=exporter.DOCKER_TIMEOUT_SECONDS)
+        self.assertLess(exporter.DOCKER_TIMEOUT_SECONDS, 30)
 
 
 class HealthzEndpointTest(unittest.TestCase):
@@ -274,7 +329,8 @@ class HealthzEndpointTest(unittest.TestCase):
     def test_fails_when_docker_is_unreachable(self):
         exporter.client.ping.side_effect = ConnectionError('no docker socket')
 
-        response = exporter.app.test_client().get('/healthz')
+        with self.assertLogs(exporter.app.logger, 'ERROR'):
+            response = exporter.app.test_client().get('/healthz')
 
         self.assertEqual(response.status_code, 500)
 
